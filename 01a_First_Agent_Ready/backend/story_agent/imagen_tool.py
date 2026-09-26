@@ -73,7 +73,7 @@ class ImagenTool(BaseTool):
             images.append(self._generate_one_image(prompt, aspect_ratio))
         return images
 
-    def _generate_one_image(self, prompt: str, aspect_ratio: str, max_attempts: int = 4) -> bytes:
+    def _generate_one_image(self, prompt: str, aspect_ratio: str, max_attempts: int = 6) -> bytes:
         """Request a single image, retrying on rate limits and on responses without an image."""
         last_error = "no image returned"
         for attempt in range(1, max_attempts + 1):
@@ -101,7 +101,7 @@ class ImagenTool(BaseTool):
                     raise
                 last_error = f"{e.code} {e.status}: {e.message}"
             if attempt < max_attempts:
-                delay = 5 * 2 ** (attempt - 1)  # 5s, 10s, 20s
+                delay = min(5 * 2 ** (attempt - 1), 30)  # 5s, 10s, 20s, 30s, 30s
                 print(f"⚠️ Image attempt {attempt} failed ({last_error}); retrying in {delay}s")
                 time.sleep(delay)
         raise RuntimeError(f"Image generation failed after {max_attempts} attempts: {last_error}")

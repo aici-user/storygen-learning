@@ -1,9 +1,12 @@
+import asyncio
 import os
 import json
 import base64
 import tempfile
+import time
 from typing import Dict, Any, List
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from google.adk.tools import BaseTool, ToolContext
 from google.cloud import storage
@@ -67,19 +70,41 @@ class ImagenTool(BaseTool):
         images: List[bytes] = []
         # Gemini image models return one image per request
         for _ in range(number_of_images):
-            response = self._client.models.generate_content(
-                model=self._model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE"],
-                    image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
-                ),
-            )
-            for candidate in response.candidates or []:
-                for part in (candidate.content.parts if candidate.content else None) or []:
-                    if part.inline_data and part.inline_data.data:
-                        images.append(part.inline_data.data)
+            images.append(self._generate_one_image(prompt, aspect_ratio))
         return images
+
+    def _generate_one_image(self, prompt: str, aspect_ratio: str, max_attempts: int = 4) -> bytes:
+        """Request a single image, retrying on rate limits and on responses without an image."""
+        last_error = "no image returned"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self._client.models.generate_content(
+                    model=self._model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
+                    ),
+                )
+                for candidate in response.candidates or []:
+                    for part in (candidate.content.parts if candidate.content else None) or []:
+                        if part.inline_data and part.inline_data.data:
+                            return part.inline_data.data
+                # No image: record why (e.g. a safety block) and try again
+                reasons = [str(c.finish_reason) for c in response.candidates or []]
+                if response.prompt_feedback and response.prompt_feedback.block_reason:
+                    reasons.append(f"prompt blocked: {response.prompt_feedback.block_reason}")
+                last_error = f"no image returned ({', '.join(reasons) or 'empty response'})"
+            except genai_errors.APIError as e:
+                # Only rate limits and server errors are worth retrying
+                if e.code != 429 and (e.code or 0) < 500:
+                    raise
+                last_error = f"{e.code} {e.status}: {e.message}"
+            if attempt < max_attempts:
+                delay = 5 * 2 ** (attempt - 1)  # 5s, 10s, 20s
+                print(f"⚠️ Image attempt {attempt} failed ({last_error}); retrying in {delay}s")
+                time.sleep(delay)
+        raise RuntimeError(f"Image generation failed after {max_attempts} attempts: {last_error}")
 
     def get_json_schema(self) -> Dict[str, Any]:
         """Return the JSON schema for this tool's parameters."""
@@ -136,8 +161,10 @@ class ImagenTool(BaseTool):
             
             print(f"🎨 Generating image with prompt: {full_prompt}")
             
-            # Generate image using Vertex AI Imagen
-            images = self._generate_image_bytes(full_prompt, number_of_images, aspect_ratio)
+            # Run the blocking API call in a thread so the WebSocket stays responsive
+            images = await asyncio.to_thread(
+                self._generate_image_bytes, full_prompt, number_of_images, aspect_ratio
+            )
 
             image_results = []
 

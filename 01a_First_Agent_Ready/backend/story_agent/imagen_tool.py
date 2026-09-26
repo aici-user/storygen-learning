@@ -37,9 +37,14 @@ class ImagenTool(BaseTool):
         if not self._bucket_name:
             print("⚠️  Warning: GENMEDIA_BUCKET not set. Images will be returned as base64 payloads which may cause token issues.")
         
-        # Initialize the Gen AI client on Vertex AI (imagegeneration@006 has been retired)
-        self._client = genai.Client(vertexai=True, project=self._project_id, location=self._location)
-        self._model_name = os.getenv("IMAGEN_MODEL", "imagen-4.0-generate-001")
+        # Initialize the Gen AI client on Vertex AI. Imagen models have been retired,
+        # so images come from a Gemini image model, served from the global endpoint.
+        self._client = genai.Client(
+            vertexai=True,
+            project=self._project_id,
+            location=os.getenv("IMAGE_MODEL_LOCATION", "global"),
+        )
+        self._model_name = os.getenv("IMAGEN_MODEL", "gemini-3.1-flash-image")
         
         # Initialize GCS client if bucket is configured
         self._storage_client = None
@@ -58,18 +63,23 @@ class ImagenTool(BaseTool):
                 self._storage_client = None
 
     def _generate_image_bytes(self, prompt: str, number_of_images: int, aspect_ratio: str) -> List[bytes]:
-        """Call Imagen and return the raw PNG bytes of each generated image."""
-        # Current Imagen models do not accept negative_prompt, so it is not passed
-        response = self._client.models.generate_images(
-            model=self._model_name,
-            prompt=prompt,
-            config=types.GenerateImagesConfig(
-                number_of_images=number_of_images,
-                aspect_ratio=aspect_ratio,
-                output_mime_type="image/png",
-            ),
-        )
-        return [img.image.image_bytes for img in (response.generated_images or []) if img.image]
+        """Call the Gemini image model and return the raw bytes of each generated image."""
+        images: List[bytes] = []
+        # Gemini image models return one image per request
+        for _ in range(number_of_images):
+            response = self._client.models.generate_content(
+                model=self._model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                    image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
+                ),
+            )
+            for candidate in response.candidates or []:
+                for part in (candidate.content.parts if candidate.content else None) or []:
+                    if part.inline_data and part.inline_data.data:
+                        images.append(part.inline_data.data)
+        return images
 
     def get_json_schema(self) -> Dict[str, Any]:
         """Return the JSON schema for this tool's parameters."""

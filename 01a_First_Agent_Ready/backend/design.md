@@ -23,7 +23,7 @@ The script must import the following module:
 
 -   A global variable named `root_agent` will be defined and instantiated directly at the module level.
 -   The `LlmAgent` instance must be configured with the following exact specifications:
-    -   `model`: `"gemini-2.5-flash"`
+    -   `model`: `"gemini-3.8-flash"`
     -   `name`: `"story_agent"`
     -   `description`: `"Generates creative short stories and accompanying visual keyframes based on user-provided keywords and themes."`
     -   `instruction`: The instruction prompt must be a multi-line string with the following exact content:

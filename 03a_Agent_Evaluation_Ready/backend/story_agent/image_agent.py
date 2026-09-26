@@ -25,7 +25,7 @@ else:
 
 # ADK-compatible Image Generation Agent
 root_agent = LlmAgent(
-    model="gemini-1.5-flash",  # Using gemini-1.5-flash which supports streaming
+    model="gemini-3.8-flash",  # Supports streaming
     name="image_agent",
     description="Generates consistent cartoon-style illustrations for children's stories using Google Vertex AI Imagen.",
     instruction="""You are an expert illustrator for children's storybooks. Your role is to generate beautiful, consistent cartoon-style images that bring stories to life.

@@ -1,10 +1,13 @@
+import asyncio
 import os
 import json
 import base64
 import tempfile
+import time
 from typing import Dict, Any, List
-import vertexai
-from vertexai.preview.vision_models import ImageGenerationModel
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 from google.adk.tools import BaseTool, ToolContext
 from google.cloud import storage
 from google.oauth2 import service_account
@@ -37,9 +40,14 @@ class ImagenTool(BaseTool):
         if not self._bucket_name:
             print("⚠️  Warning: GENMEDIA_BUCKET not set. Images will be returned as base64 payloads which may cause token issues.")
         
-        # Initialize Vertex AI
-        vertexai.init(project=self._project_id, location=self._location)
-        self._model = ImageGenerationModel.from_pretrained("imagegeneration@006")
+        # Initialize the Gen AI client on Vertex AI. Imagen models have been retired,
+        # so images come from a Gemini image model, served from the global endpoint.
+        self._client = genai.Client(
+            vertexai=True,
+            project=self._project_id,
+            location=os.getenv("IMAGE_MODEL_LOCATION", "global"),
+        )
+        self._model_name = os.getenv("IMAGEN_MODEL", "gemini-3.1-flash-image")
         
         # Initialize GCS client if bucket is configured
         self._storage_client = None
@@ -56,7 +64,48 @@ class ImagenTool(BaseTool):
             except Exception as e:
                 print(f"⚠️  Failed to initialize GCS client: {e}")
                 self._storage_client = None
-    
+
+    def _generate_image_bytes(self, prompt: str, number_of_images: int, aspect_ratio: str) -> List[bytes]:
+        """Call the Gemini image model and return the raw bytes of each generated image."""
+        images: List[bytes] = []
+        # Gemini image models return one image per request
+        for _ in range(number_of_images):
+            images.append(self._generate_one_image(prompt, aspect_ratio))
+        return images
+
+    def _generate_one_image(self, prompt: str, aspect_ratio: str, max_attempts: int = 6) -> bytes:
+        """Request a single image, retrying on rate limits and on responses without an image."""
+        last_error = "no image returned"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self._client.models.generate_content(
+                    model=self._model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
+                    ),
+                )
+                for candidate in response.candidates or []:
+                    for part in (candidate.content.parts if candidate.content else None) or []:
+                        if part.inline_data and part.inline_data.data:
+                            return part.inline_data.data
+                # No image: record why (e.g. a safety block) and try again
+                reasons = [str(c.finish_reason) for c in response.candidates or []]
+                if response.prompt_feedback and response.prompt_feedback.block_reason:
+                    reasons.append(f"prompt blocked: {response.prompt_feedback.block_reason}")
+                last_error = f"no image returned ({', '.join(reasons) or 'empty response'})"
+            except genai_errors.APIError as e:
+                # Only rate limits and server errors are worth retrying
+                if e.code != 429 and (e.code or 0) < 500:
+                    raise
+                last_error = f"{e.code} {e.status}: {e.message}"
+            if attempt < max_attempts:
+                delay = min(5 * 2 ** (attempt - 1), 30)  # 5s, 10s, 20s, 30s, 30s
+                print(f"⚠️ Image attempt {attempt} failed ({last_error}); retrying in {delay}s")
+                time.sleep(delay)
+        raise RuntimeError(f"Image generation failed after {max_attempts} attempts: {last_error}")
+
     def get_json_schema(self) -> Dict[str, Any]:
         """Return the JSON schema for this tool's parameters."""
         return {
@@ -112,25 +161,20 @@ class ImagenTool(BaseTool):
             
             print(f"🎨 Generating image with prompt: {full_prompt}")
             
-            # Generate image using Vertex AI Imagen
-            response = self._model.generate_images(
-                prompt=full_prompt,
-                number_of_images=number_of_images,
-                negative_prompt=negative_prompt,
-                aspect_ratio=aspect_ratio
+            # Run the blocking API call in a thread so the WebSocket stays responsive
+            images = await asyncio.to_thread(
+                self._generate_image_bytes, full_prompt, number_of_images, aspect_ratio
             )
-            
-            # Access the images property of the response
-            images = response.images if hasattr(response, 'images') else []
-            
+
             image_results = []
-            
-            for i, image in enumerate(images):
+
+            for i, image_bytes in enumerate(images):
                 try:
                     # Save to temporary file first
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-                        image.save(location=temp_file.name)
-                        
+                        temp_file.write(image_bytes)
+                        temp_file.flush()
+
                         # If bucket is configured, upload to GCS
                         if self._storage_client and self._bucket_name:
                             try:
@@ -193,6 +237,85 @@ class ImagenTool(BaseTool):
                 "success": False,
                 "error": f"Image generation failed: {str(e)}"
             })
+    
+    def generate_and_store(
+        self,
+        prompt: str,
+        number_of_images: int = 1,
+        negative_prompt: str = "photorealistic, realistic, blurry, low quality, watermark, text overlay",
+        aspect_ratio: str = "16:9"
+    ) -> List[Dict[str, Any]]:
+        """Generate images and store them in GCS bucket, returning list of results."""
+        
+        style_prefix = (
+            "Children's book illustration in cartoon style with bright vibrant colors, simple shapes, and friendly characters. "
+        )
+        full_prompt = f"{style_prefix} {prompt}".strip()
+        
+        print(f"🎨 Generating {number_of_images} image(s) with prompt: {full_prompt[:100]}...")
+        
+        try:
+            images = self._generate_image_bytes(full_prompt, number_of_images, aspect_ratio)
+            print(f"✅ Imagen API returned {len(images)} images")
+        except Exception as e:
+            print(f"❌ Imagen API failed: {e}")
+            return []
+        
+        if not images:
+            print("⚠️ No images returned from Imagen API")
+            return []
+            
+        results: List[Dict[str, Any]] = []
+        for i, image_bytes in enumerate(images):
+            print(f"📷 Processing image {i+1}/{len(images)}")
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+                    temp_file.write(image_bytes)
+                    temp_file.flush()
+                    print(f"💾 Saved image {i+1} to temp file: {temp_file.name}")
+                    
+                    # Always read base64 for fallback
+                    with open(temp_file.name, "rb") as img_file:
+                        img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                    
+                    if self._storage_client and self._bucket_name:
+                        try:
+                            gcs_url = self._upload_to_bucket(temp_file.name, full_prompt, i)
+                            print(f"☁️ Uploaded image {i+1} to GCS: {gcs_url}")
+                            results.append({
+                                "index": i,
+                                "gcs_url": gcs_url,
+                                "base64": img_base64,  # Include base64 as fallback
+                                "format": "png",
+                                "stored_in_bucket": True
+                            })
+                        except Exception as e:
+                            print(f"❌ GCS upload failed for image {i+1}: {e}")
+                            results.append({
+                                "index": i,
+                                "base64": img_base64,
+                                "format": "png",
+                                "stored_in_bucket": False,
+                                "bucket_error": str(e)
+                            })
+                    else:
+                        print(f"📦 No bucket configured, using base64 for image {i+1}")
+                        results.append({
+                            "index": i,
+                            "base64": img_base64,
+                            "format": "png",
+                            "stored_in_bucket": False
+                        })
+                    
+                    os.unlink(temp_file.name)
+                    print(f"🗑️ Cleaned up temp file for image {i+1}")
+                    
+            except Exception as e:
+                print(f"❌ Failed to process image {i+1}: {e}")
+                continue
+                
+        print(f"✅ Successfully processed {len(results)} out of {len(images)} images")
+        return results
 
     def _upload_to_bucket(self, local_path: str, prompt: str, index: int) -> str:
         """Upload image to GCS bucket and return public URL."""
@@ -218,5 +341,7 @@ class ImagenTool(BaseTool):
         # Make the blob publicly readable
         blob.make_public()
         
+        # Don't use make_public() with uniform bucket-level access
+        # Instead, assume the bucket is already public or use the public URL format
         # Return public HTTPS URL for browser display
-        return blob.public_url
+        return blob.public_url 

@@ -103,7 +103,7 @@ The server will start at `http://localhost:8000`
 ## Agent Configuration
 
 The story agent is configured with:
-- **Model**: `gemini-2.0-flash-exp` (latest Gemini model)
+- **Model**: `gemini-3.8-flash`
 - **Purpose**: Creative story generation
 - **Input**: Keywords/themes from users
 - **Output**: 200-400 word creative stories
@@ -146,7 +146,7 @@ The server provides detailed logging for:
 
 1. **API Key Error**: Ensure your Google API key is correctly set in `.env`
 2. **SSL Certificate Error**: Run `export SSL_CERT_FILE=$(python -m certifi)`
-3. **Model Not Available**: Try changing to `gemini-2.0-flash-live-001` in `agent.py`
+3. **Model Not Available**: Use the replacement model named in the error message and update `model=` in `agent.py`
 4. **WebSocket Connection Issues**: Check CORS settings and port availability
 
 ### Dependencies

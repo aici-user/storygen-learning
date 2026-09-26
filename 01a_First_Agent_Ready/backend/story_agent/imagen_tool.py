@@ -3,8 +3,8 @@ import json
 import base64
 import tempfile
 from typing import Dict, Any, List
-import vertexai
-from vertexai.preview.vision_models import ImageGenerationModel
+from google import genai
+from google.genai import types
 from google.adk.tools import BaseTool, ToolContext
 from google.cloud import storage
 from google.oauth2 import service_account
@@ -37,9 +37,9 @@ class ImagenTool(BaseTool):
         if not self._bucket_name:
             print("⚠️  Warning: GENMEDIA_BUCKET not set. Images will be returned as base64 payloads which may cause token issues.")
         
-        # Initialize Vertex AI
-        vertexai.init(project=self._project_id, location=self._location)
-        self._model = ImageGenerationModel.from_pretrained("imagegeneration@006")
+        # Initialize the Gen AI client on Vertex AI (imagegeneration@006 has been retired)
+        self._client = genai.Client(vertexai=True, project=self._project_id, location=self._location)
+        self._model_name = os.getenv("IMAGEN_MODEL", "imagen-4.0-generate-001")
         
         # Initialize GCS client if bucket is configured
         self._storage_client = None
@@ -56,7 +56,21 @@ class ImagenTool(BaseTool):
             except Exception as e:
                 print(f"⚠️  Failed to initialize GCS client: {e}")
                 self._storage_client = None
-    
+
+    def _generate_image_bytes(self, prompt: str, number_of_images: int, aspect_ratio: str) -> List[bytes]:
+        """Call Imagen and return the raw PNG bytes of each generated image."""
+        # Current Imagen models do not accept negative_prompt, so it is not passed
+        response = self._client.models.generate_images(
+            model=self._model_name,
+            prompt=prompt,
+            config=types.GenerateImagesConfig(
+                number_of_images=number_of_images,
+                aspect_ratio=aspect_ratio,
+                output_mime_type="image/png",
+            ),
+        )
+        return [img.image.image_bytes for img in (response.generated_images or []) if img.image]
+
     def get_json_schema(self) -> Dict[str, Any]:
         """Return the JSON schema for this tool's parameters."""
         return {
@@ -113,24 +127,17 @@ class ImagenTool(BaseTool):
             print(f"🎨 Generating image with prompt: {full_prompt}")
             
             # Generate image using Vertex AI Imagen
-            response = self._model.generate_images(
-                prompt=full_prompt,
-                number_of_images=number_of_images,
-                negative_prompt=negative_prompt,
-                aspect_ratio=aspect_ratio
-            )
-            
-            # Access the images property of the response
-            images = response.images if hasattr(response, 'images') else []
-            
+            images = self._generate_image_bytes(full_prompt, number_of_images, aspect_ratio)
+
             image_results = []
-            
-            for i, image in enumerate(images):
+
+            for i, image_bytes in enumerate(images):
                 try:
                     # Save to temporary file first
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-                        image.save(location=temp_file.name)
-                        
+                        temp_file.write(image_bytes)
+                        temp_file.flush()
+
                         # If bucket is configured, upload to GCS
                         if self._storage_client and self._bucket_name:
                             try:
@@ -211,14 +218,7 @@ class ImagenTool(BaseTool):
         print(f"🎨 Generating {number_of_images} image(s) with prompt: {full_prompt[:100]}...")
         
         try:
-            response = self._model.generate_images(
-                prompt=full_prompt,
-                number_of_images=number_of_images,
-                negative_prompt=negative_prompt,
-                aspect_ratio=aspect_ratio
-            )
-            # Access the images property of the response
-            images = response.images if hasattr(response, 'images') else []
+            images = self._generate_image_bytes(full_prompt, number_of_images, aspect_ratio)
             print(f"✅ Imagen API returned {len(images)} images")
         except Exception as e:
             print(f"❌ Imagen API failed: {e}")
@@ -229,11 +229,12 @@ class ImagenTool(BaseTool):
             return []
             
         results: List[Dict[str, Any]] = []
-        for i, image in enumerate(images):
+        for i, image_bytes in enumerate(images):
             print(f"📷 Processing image {i+1}/{len(images)}")
             try:
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-                    image.save(location=temp_file.name)
+                    temp_file.write(image_bytes)
+                    temp_file.flush()
                     print(f"💾 Saved image {i+1} to temp file: {temp_file.name}")
                     
                     # Always read base64 for fallback
